@@ -1,0 +1,8 @@
+services:
+  leaguebot:
+    build: .
+    container_name: leaguebot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/bot/data  # Persist sqlite database

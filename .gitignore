@@ -1,4 +1,5 @@
 .env
 .venv
 *.db
+league.db
 __pycache__/
