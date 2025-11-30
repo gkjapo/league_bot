@@ -1,0 +1,6 @@
+{
+  "hardpoint": ["A_BAN", "B_BAN", "A_PICK_MAP_1", "B_PICK_SIDE_MAP_1", "B_PICK_MAP_4", "A_PICK_SIDE_MAP_4"],
+  "search": ["B_BAN", "A_BAN", "B_PICK_MAP_2", "A_PICK_SIDE_MAP_2", "A_PICK_MAP_5", "B_PICK_SIDE_MAP_5"],
+  "overload": ["A_BAN", "B__PICK_MAP_3", "A_PICK_SIDE_3"],
+  "sides": ["JSOC", "GUILD"]
+}

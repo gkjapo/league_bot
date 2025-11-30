@@ -1,0 +1,5 @@
+{
+  "hardpoint": ["Blackheart", "Colossus", "Den", "Exposure", "Scar"],
+  "search": ["Colossus", "Den", "Exposure", "Raid", "Scar"],
+  "overload": ["Den", "Exposure", "Scar"]
+}
