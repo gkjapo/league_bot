@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from discord.ui import View, Button
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
 from dotenv import load_dotenv
 import random
@@ -13,6 +14,11 @@ import json
 # -----------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "league_bot")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 # -----------------------------
 # Load veto flows
@@ -22,60 +28,83 @@ with open("veto_flows.json", "r") as f:
     SIDE_NAMES = VETO_FLOWS.get("sides", ["Home Side", "Away Side"])
 
 # -----------------------------
-# Database
+# Database Connection
 # -----------------------------
-conn = sqlite3.connect("league.db")
-c = conn.cursor()
+def get_db_connection():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
 
-# Teams
-c.execute("""
-CREATE TABLE IF NOT EXISTS teams (
-    team_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_name TEXT UNIQUE
-)
-""")
+# Initialize database tables
+def init_database():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Teams table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS teams (
+        team_id SERIAL PRIMARY KEY,
+        guild_id BIGINT NOT NULL,
+        team_name TEXT NOT NULL,
+        UNIQUE(guild_id, team_name)
+    )
+    """)
+    
+    # Players table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS players (
+        player_id SERIAL PRIMARY KEY,
+        guild_id BIGINT NOT NULL,
+        team_id INTEGER REFERENCES teams(team_id) ON DELETE CASCADE,
+        player_name TEXT NOT NULL,
+        is_captain INTEGER DEFAULT 0
+    )
+    """)
+    
+    # Schedule table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS schedule (
+        match_id SERIAL PRIMARY KEY,
+        guild_id BIGINT NOT NULL,
+        week INTEGER NOT NULL,
+        team_a TEXT NOT NULL,
+        team_b TEXT NOT NULL
+    )
+    """)
+    
+    # League settings table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS league_settings (
+        guild_id BIGINT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT,
+        PRIMARY KEY(guild_id, key)
+    )
+    """)
+    
+    # Match results table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS match_results (
+        thread_id BIGINT PRIMARY KEY,
+        guild_id BIGINT NOT NULL,
+        team_a TEXT NOT NULL,
+        team_b TEXT NOT NULL,
+        map_wins_a INTEGER NOT NULL,
+        map_wins_b INTEGER NOT NULL,
+        is_playoff INTEGER DEFAULT 0
+    )
+    """)
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
-# Players
-c.execute("""
-CREATE TABLE IF NOT EXISTS players (
-    player_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER,
-    player_name TEXT,
-    is_captain INTEGER DEFAULT 0,
-    FOREIGN KEY(team_id) REFERENCES teams(team_id)
-)
-""")
-
-# Schedule
-c.execute("""
-CREATE TABLE IF NOT EXISTS schedule (
-    match_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    week INTEGER,
-    team_a TEXT,
-    team_b TEXT
-)
-""")
-
-# Settings
-c.execute("""
-CREATE TABLE IF NOT EXISTS league_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-)
-""")
-
-# Match results
-c.execute("""
-CREATE TABLE IF NOT EXISTS match_results (
-    thread_id INTEGER PRIMARY KEY,
-    team_a TEXT,
-    team_b TEXT,
-    map_wins_a INTEGER,
-    map_wins_b INTEGER,
-    is_playoff INTEGER DEFAULT 0
-)
-""")
-conn.commit()
+# Initialize database on startup
+init_database()
 
 # -----------------------------
 # Bot setup
@@ -94,17 +123,26 @@ tree = bot.tree
 def is_guild_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
 
-def is_schedule_locked() -> bool:
-    c.execute("SELECT value FROM league_settings WHERE key='locked'")
-    row = c.fetchone()
+def is_schedule_locked(guild_id: int) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM league_settings WHERE guild_id=%s AND key='locked'", (guild_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
     return row and row[0] == "True"
 
-def get_team_captains(team_name: str):
-    c.execute("""
+def get_team_captains(guild_id: int, team_name: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
     SELECT player_id FROM players
-    WHERE team_id = (SELECT team_id FROM teams WHERE team_name=?) AND is_captain=1
-    """, (team_name,))
-    return [row[0] for row in c.fetchall()]
+    WHERE guild_id=%s AND team_id = (SELECT team_id FROM teams WHERE guild_id=%s AND team_name=%s) AND is_captain=1
+    """, (guild_id, guild_id, team_name))
+    result = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return result
 
 # -----------------------------
 # BO7 Veto Session Classes
@@ -501,15 +539,26 @@ class MapVetoView(View):
 # -----------------------------
 @tree.command(name="show_teams", description="List all teams and their players with IDs")
 async def show_teams(interaction: discord.Interaction):
-    c.execute("SELECT team_id, team_name FROM teams")
-    teams = c.fetchall()
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT team_id, team_name FROM teams WHERE guild_id=%s", (guild_id,))
+    teams = cur.fetchall()
+    
     if not teams:
+        cur.close()
+        conn.close()
         return await interaction.response.send_message("No teams found.", ephemeral=True)
+    
     embed = discord.Embed(title="Teams and Players")
     for team_id, team_name in teams:
-        c.execute("SELECT player_name FROM players WHERE team_id=?", (team_id,))
-        players = [row[0] for row in c.fetchall()]
+        cur.execute("SELECT player_name FROM players WHERE guild_id=%s AND team_id=%s", (guild_id, team_id))
+        players = [row[0] for row in cur.fetchall()]
         embed.add_field(name=f"{team_name} (ID {team_id})", value=", ".join(players) or "No players", inline=False)
+    
+    cur.close()
+    conn.close()
     await interaction.response.send_message(embed=embed)
     
 @tree.command(name="register_team", description="Register a new team (Admin only)")
@@ -518,14 +567,20 @@ async def register_team(interaction: discord.Interaction, team_name: str):
     if not is_guild_admin(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
-    # Check if team exists
-    c.execute("SELECT team_id FROM teams WHERE team_name=?", (team_name,))
-    if c.fetchone():
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT team_id FROM teams WHERE guild_id=%s AND team_name=%s", (guild_id, team_name))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
         return await interaction.response.send_message(f"Team '{team_name}' already exists.", ephemeral=True)
 
-    # Insert team
-    c.execute("INSERT INTO teams (team_name) VALUES (?)", (team_name,))
+    cur.execute("INSERT INTO teams (guild_id, team_name) VALUES (%s, %s)", (guild_id, team_name))
     conn.commit()
+    cur.close()
+    conn.close()
 
     await interaction.response.send_message(f"Team '{team_name}' registered successfully.", ephemeral=False)
 
@@ -535,17 +590,24 @@ async def add_player(interaction: discord.Interaction, team_id: int, player_name
     if not is_guild_admin(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
-    # Check if team exists
-    c.execute("SELECT team_name FROM teams WHERE team_id=?", (team_id,))
-    row = c.fetchone()
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT team_name FROM teams WHERE guild_id=%s AND team_id=%s", (guild_id, team_id))
+    row = cur.fetchone()
     if not row:
+        cur.close()
+        conn.close()
         return await interaction.response.send_message(f"No team found with ID {team_id}.", ephemeral=True)
 
-    c.execute(
-        "INSERT INTO players (team_id, player_name, is_captain) VALUES (?, ?, ?)",
-        (team_id, player_name, int(is_captain))
+    cur.execute(
+        "INSERT INTO players (guild_id, team_id, player_name, is_captain) VALUES (%s, %s, %s, %s)",
+        (guild_id, team_id, player_name, int(is_captain))
     )
     conn.commit()
+    cur.close()
+    conn.close()
 
     await interaction.response.send_message(f"Player '{player_name}' added to team '{row[0]}'.", ephemeral=False)
 
@@ -559,20 +621,23 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
     if not is_guild_admin(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
-    # Check if schedule is locked
-    if is_schedule_locked():
+    guild_id = interaction.guild_id
+
+    if is_schedule_locked(guild_id):
         return await interaction.response.send_message("Schedule is locked and cannot be changed.", ephemeral=True)
 
-    # Get all teams
-    c.execute("SELECT team_name FROM teams")
-    teams = [row[0] for row in c.fetchall()]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT team_name FROM teams WHERE guild_id=%s", (guild_id,))
+    teams = [row[0] for row in cur.fetchall()]
     if len(teams) < 2:
+        cur.close()
+        conn.close()
         return await interaction.response.send_message("At least 2 teams are required to generate a schedule.", ephemeral=True)
 
-    # Clear old schedule
-    c.execute("DELETE FROM schedule")
+    cur.execute("DELETE FROM schedule WHERE guild_id=%s", (guild_id,))
 
-    # Simple round-robin schedule
     matchups = []
     for week in range(1, weeks + 1):
         shuffled = teams[:]
@@ -580,11 +645,12 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
         for i in range(0, len(shuffled) - 1, 2):
             team_a = shuffled[i]
             team_b = shuffled[i + 1]
-            matchups.append((week, team_a, team_b))
+            matchups.append((guild_id, week, team_a, team_b))
 
-    # Insert into database
-    c.executemany("INSERT INTO schedule (week, team_a, team_b) VALUES (?, ?, ?)", matchups)
+    cur.executemany("INSERT INTO schedule (guild_id, week, team_a, team_b) VALUES (%s, %s, %s, %s)", matchups)
     conn.commit()
+    cur.close()
+    conn.close()
 
     await interaction.response.send_message(f"Generated schedule for {weeks} weeks with {len(matchups)} matches.", ephemeral=False)
 
@@ -595,16 +661,24 @@ async def lock_schedule(interaction: discord.Interaction, channel: discord.TextC
     if not is_guild_admin(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
-    if is_schedule_locked():
+    guild_id = interaction.guild_id
+
+    if is_schedule_locked(guild_id):
         return await interaction.response.send_message("Schedule is already locked.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
 
-    c.execute("INSERT OR REPLACE INTO league_settings (key, value) VALUES ('locked','True')")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("INSERT INTO league_settings (guild_id, key, value) VALUES (%s, 'locked', 'True') ON CONFLICT (guild_id, key) DO UPDATE SET value='True'", (guild_id,))
     conn.commit()
 
-    c.execute("SELECT team_a, team_b, week FROM schedule ORDER BY week")
-    matches = c.fetchall()
+    cur.execute("SELECT team_a, team_b, week FROM schedule WHERE guild_id=%s ORDER BY week", (guild_id,))
+    matches = cur.fetchall()
+    cur.close()
+    conn.close()
+    
     created_threads = []
     for team_a, team_b, week in matches:
         thread_name = f"Week {week}: {team_a} vs {team_b}"
@@ -619,9 +693,16 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
     if not is_guild_admin(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
-    c.execute("SELECT team_a, team_b FROM schedule")
-    matches = c.fetchall()
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT team_a, team_b FROM schedule WHERE guild_id=%s", (guild_id,))
+    matches = cur.fetchall()
+    
     if not matches:
+        cur.close()
+        conn.close()
         return await interaction.response.send_message("No schedule found.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
@@ -637,16 +718,25 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
                 except Exception as e:
                     print(f"Failed to delete thread {thread_name}: {e}")
 
-    c.execute("DELETE FROM schedule")
-    c.execute("INSERT OR REPLACE INTO league_settings (key, value) VALUES ('locked','False')")
+    cur.execute("DELETE FROM schedule WHERE guild_id=%s", (guild_id,))
+    cur.execute("INSERT INTO league_settings (guild_id, key, value) VALUES (%s, 'locked', 'False') ON CONFLICT (guild_id, key) DO UPDATE SET value='False'", (guild_id,))
     conn.commit()
+    cur.close()
+    conn.close()
 
     await interaction.followup.send("Deleted schedule and match threads:\n" + "\n".join(deleted_threads), ephemeral=True)
     
 @tree.command(name="show_schedule", description="Show the current league schedule")
 async def show_schedule(interaction: discord.Interaction):
-    c.execute("SELECT match_id, week, team_a, team_b FROM schedule ORDER BY week, match_id")
-    rows = c.fetchall()
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT match_id, week, team_a, team_b FROM schedule WHERE guild_id=%s ORDER BY week, match_id", (guild_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    
     if not rows:
         return await interaction.response.send_message("No schedule found.", ephemeral=True)
     
@@ -673,7 +763,7 @@ async def start_match(interaction: discord.Interaction):
     if len(parts) < 2:
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
 
-    team_a = parts[0].strip().split(": ")[-1]  # Remove "Week X: " prefix if present
+    team_a = parts[0].strip().split(": ")[-1]
     team_b = parts[1].strip()
 
     session = MatchVetoSession(thread, team_a, team_b)
@@ -694,9 +784,6 @@ async def show_match(interaction: discord.Interaction):
 
     team_a = parts[0].strip().split(": ")[-1]
     team_b = parts[1].strip()
-
-    # Try to get the session data from the database or reconstruct from messages
-    # For now, we'll parse the thread messages to extract veto results
     
     embed = discord.Embed(
         title=f"Match: {team_a} vs {team_b}",
@@ -765,6 +852,7 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
     if not isinstance(interaction.channel, discord.Thread):
         return await interaction.response.send_message("Use this command inside a match thread.", ephemeral=True)
 
+    guild_id = interaction.guild_id
     thread = interaction.channel
     parts = thread.name.split(" vs ")
     if len(parts) < 2:
@@ -774,19 +862,36 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
     team_a = parts[0].strip().split(": ")[-1]
     team_b = parts[1].strip()
 
-    c.execute("""
-        INSERT OR REPLACE INTO match_results (thread_id, team_a, team_b, map_wins_a, map_wins_b, is_playoff)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (thread.id, team_a, team_b, map_wins_a, map_wins_b, int(playoff)))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        INSERT INTO match_results (thread_id, guild_id, team_a, team_b, map_wins_a, map_wins_b, is_playoff)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (thread_id) DO UPDATE SET
+        guild_id=%s, team_a=%s, team_b=%s, map_wins_a=%s, map_wins_b=%s, is_playoff=%s
+    """, (thread.id, guild_id, team_a, team_b, map_wins_a, map_wins_b, int(playoff),
+          guild_id, team_a, team_b, map_wins_a, map_wins_b, int(playoff)))
     conn.commit()
+    cur.close()
+    conn.close()
+    
     await interaction.response.send_message(f"Result recorded: {team_a} {map_wins_a} - {map_wins_b} {team_b}", ephemeral=False)
 
 @tree.command(name="show_results", description="Show all match results")
 async def show_results(interaction: discord.Interaction):
-    c.execute("SELECT team_a, team_b, map_wins_a, map_wins_b FROM match_results ORDER BY thread_id")
-    rows = c.fetchall()
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT team_a, team_b, map_wins_a, map_wins_b FROM match_results WHERE guild_id=%s ORDER BY thread_id", (guild_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    
     if not rows:
         return await interaction.response.send_message("No match results recorded yet.", ephemeral=True)
+    
     embed = discord.Embed(title="League Match Results")
     for team_a, team_b, wins_a, wins_b in rows:
         embed.add_field(name=f"{team_a} vs {team_b}", value=f"{wins_a} - {wins_b}", inline=False)
@@ -794,8 +899,15 @@ async def show_results(interaction: discord.Interaction):
 
 @tree.command(name="standings", description="Show league standings")
 async def standings(interaction: discord.Interaction):
-    c.execute("SELECT team_a, team_b, map_wins_a, map_wins_b FROM match_results")
-    rows = c.fetchall()
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT team_a, team_b, map_wins_a, map_wins_b FROM match_results WHERE guild_id=%s", (guild_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    
     if not rows:
         return await interaction.response.send_message("No match results recorded yet.", ephemeral=True)
 
@@ -868,6 +980,7 @@ async def help_command(interaction: discord.Interaction):
         name="🎮 Match Management",
         value=(
             "`/start_match` - Start veto process in match thread\n"
+            "`/show_match` - Show complete mapset for this match\n"
             "`/set_result <map_wins_a> <map_wins_b> [playoff]` - Record match result\n"
             "`/show_results` - View all match results\n"
             "`/standings` - View league standings"

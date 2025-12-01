@@ -1,9 +1,28 @@
+version: "3.9"
+
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: league_db
+    environment:
+      POSTGRES_DB: league
+      POSTGRES_USER: botuser
+      POSTGRES_PASSWORD: botpass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
   bo7bot:
     build: .
     container_name: bo7bot
-    restart: unless-stopped
     env_file: .env
+    depends_on:
+      - db
     volumes:
-      - ./data:/app/data   # sqlite DB persists here
-    network_mode: "host"   # discord bots work best without NAT
+      - ./data:/app/data  # optional, e.g., for logs
+    restart: unless-stopped
+
+volumes:
+  pgdata:
