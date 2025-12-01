@@ -769,7 +769,9 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
     parts = thread.name.split(" vs ")
     if len(parts) < 2:
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
-    team_a = parts[0].strip()
+    
+    # Extract actual team names (remove "Week X: " prefix if present)
+    team_a = parts[0].strip().split(": ")[-1]
     team_b = parts[1].strip()
 
     c.execute("""
