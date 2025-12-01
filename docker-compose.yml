@@ -5,9 +5,9 @@ services:
     image: postgres:16-alpine
     container_name: league_db
     environment:
-      POSTGRES_DB: league
-      POSTGRES_USER: botuser
-      POSTGRES_PASSWORD: botpass
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -21,7 +21,7 @@ services:
     depends_on:
       - db
     volumes:
-      - ./data:/app/data  # optional, e.g., for logs
+      - ./data:/app/data  # optional: logs, persistent files
     restart: unless-stopped
 
 volumes:
