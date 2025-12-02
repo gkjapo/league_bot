@@ -80,6 +80,146 @@ def get_team_captains(guild_id: int, team_name: str):
     conn.close()
     return result
 
+def update_standings(guild_id: int):
+    """Recalculate standings from match results"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Get all match results for this guild
+    cur.execute("""
+        SELECT team_a, team_b, map_wins_a, map_wins_b 
+        FROM match_results 
+        WHERE guild_id=%s AND is_playoff=0
+    """, (guild_id,))
+    results = cur.fetchall()
+    
+    # Calculate stats for each team
+    team_stats = {}
+    
+    for team_a, team_b, wins_a, wins_b in results:
+        # Initialize teams if not exists
+        for team in [team_a, team_b]:
+            if team not in team_stats:
+                team_stats[team] = {
+                    'match_wins': 0,
+                    'match_losses': 0,
+                    'match_ties': 0,
+                    'map_wins': 0,
+                    'map_losses': 0
+                }
+        
+        # Update map counts
+        team_stats[team_a]['map_wins'] += wins_a
+        team_stats[team_a]['map_losses'] += wins_b
+        team_stats[team_b]['map_wins'] += wins_b
+        team_stats[team_b]['map_losses'] += wins_a
+        
+        # Update match counts
+        if wins_a > wins_b:
+            team_stats[team_a]['match_wins'] += 1
+            team_stats[team_b]['match_losses'] += 1
+        elif wins_b > wins_a:
+            team_stats[team_b]['match_wins'] += 1
+            team_stats[team_a]['match_losses'] += 1
+        else:
+            team_stats[team_a]['match_ties'] += 1
+            team_stats[team_b]['match_ties'] += 1
+    
+    # Update standings table
+    for team_name, stats in team_stats.items():
+        total_matches = stats['match_wins'] + stats['match_losses'] + stats['match_ties']
+        total_maps = stats['map_wins'] + stats['map_losses']
+        
+        match_win_pct = (stats['match_wins'] / total_matches * 100) if total_matches > 0 else 0
+        map_win_pct = (stats['map_wins'] / total_maps * 100) if total_maps > 0 else 0
+        
+        cur.execute("""
+            INSERT INTO standings 
+            (guild_id, team_name, match_wins, match_losses, match_ties, map_wins, map_losses, 
+             match_win_percentage, map_win_percentage, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (guild_id, team_name) 
+            DO UPDATE SET
+                match_wins = EXCLUDED.match_wins,
+                match_losses = EXCLUDED.match_losses,
+                match_ties = EXCLUDED.match_ties,
+                map_wins = EXCLUDED.map_wins,
+                map_losses = EXCLUDED.map_losses,
+                match_win_percentage = EXCLUDED.match_win_percentage,
+                map_win_percentage = EXCLUDED.map_win_percentage,
+                updated_at = CURRENT_TIMESTAMP
+        """, (guild_id, team_name, stats['match_wins'], stats['match_losses'], stats['match_ties'],
+              stats['map_wins'], stats['map_losses'], match_win_pct, map_win_pct))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_team_standing(guild_id: int, team_name: str):
+    """Get standing info for a specific team"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT match_wins, match_losses, match_ties, map_wins, map_losses,
+               match_win_percentage, map_win_percentage
+        FROM standings
+        WHERE guild_id=%s AND team_name=%s
+    """, (guild_id, team_name))
+    
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if result:
+        return {
+            'match_wins': result[0],
+            'match_losses': result[1],
+            'match_ties': result[2],
+            'map_wins': result[3],
+            'map_losses': result[4],
+            'match_win_pct': result[5],
+            'map_win_pct': result[6]
+        }
+    return None
+
+def determine_higher_seed(guild_id: int, team_a: str, team_b: str):
+    """
+    Determine which team has higher seed based on standings.
+    Returns: ('A', team_a_name) or ('B', team_b_name) or ('COIN', winner_name)
+    """
+    import random
+    
+    standing_a = get_team_standing(guild_id, team_a)
+    standing_b = get_team_standing(guild_id, team_b)
+    
+    # If no standings exist for either team, do coin flip
+    if not standing_a and not standing_b:
+        winner = random.choice([team_a, team_b])
+        return ('COIN', winner)
+    
+    # If only one team has standings, they get higher seed
+    if not standing_a:
+        return ('B', team_b)
+    if not standing_b:
+        return ('A', team_a)
+    
+    # Compare match win percentage first
+    if standing_a['match_win_pct'] > standing_b['match_win_pct']:
+        return ('A', team_a)
+    elif standing_b['match_win_pct'] > standing_a['match_win_pct']:
+        return ('B', team_b)
+    
+    # If tied on match win %, compare map win %
+    if standing_a['map_win_pct'] > standing_b['map_win_pct']:
+        return ('A', team_a)
+    elif standing_b['map_win_pct'] > standing_a['map_win_pct']:
+        return ('B', team_b)
+    
+    # If completely tied, coin flip
+    winner = random.choice([team_a, team_b])
+    return ('COIN', winner)
+
 # -----------------------------
 # BO7 Veto Session Classes
 # -----------------------------
@@ -132,6 +272,77 @@ class MatchVetoSession:
 
     def get_team_name(self, team_letter: str) -> str:
         return self.team_a_name if team_letter == "A" else self.team_b_name
+
+class TeamSelectionView(View):
+    """View for higher seeded team to pick Team A or Team B"""
+    def __init__(self, session: MatchVetoSession, higher_seed_method: str):
+        super().__init__(timeout=None)
+        self.session = session
+        self.higher_seed_method = higher_seed_method
+
+    @discord.ui.button(label="Pick Team A", style=discord.ButtonStyle.primary)
+    async def pick_team_a(self, interaction: discord.Interaction, button: Button):
+        # Higher seed chose Team A, they stay as team_a
+        await interaction.response.send_message(
+            f"**{self.session.team_a_name}** will be Team A\n**{self.session.team_b_name}** will be Team B",
+            ephemeral=False
+        )
+        self.disable_all_buttons()
+        await interaction.message.edit(view=self)
+        
+        # Start the veto process
+        await self.start_veto_process(interaction)
+
+    @discord.ui.button(label="Pick Team B", style=discord.ButtonStyle.primary)
+    async def pick_team_b(self, interaction: discord.Interaction, button: Button):
+        # Higher seed chose Team B, swap the teams
+        self.session.team_a_name, self.session.team_b_name = self.session.team_b_name, self.session.team_a_name
+        
+        await interaction.response.send_message(
+            f"**{self.session.team_a_name}** will be Team A\n**{self.session.team_b_name}** will be Team B",
+            ephemeral=False
+        )
+        self.disable_all_buttons()
+        await interaction.message.edit(view=self)
+        
+        # Start the veto process
+        await self.start_veto_process(interaction)
+
+    async def start_veto_process(self, interaction: discord.Interaction):
+        """Start the first mode veto after team selection"""
+        await interaction.channel.send("Starting veto process...")
+        
+        # Start first mode
+        mode_name = self.session.mode_order[0]
+        default_maps = {
+            "hardpoint": ["Blackheart", "Colossus", "Den", "Exposure", "Scar"],
+            "search": ["Colossus", "Den", "Exposure", "Raid", "Scar"],
+            "overload": ["Den", "Exposure", "Scar"]
+        }
+        
+        maps = default_maps.get(mode_name, [])
+        mode_state = ModeVetoState(mode_name, maps)
+        self.session.mode_states[mode_name] = mode_state
+        
+        team, action_type, detail = mode_state.get_current_action()
+        team_name = self.session.get_team_name(team)
+        
+        if action_type == "BAN":
+            view = MapVetoView(self.session, mode_state)
+            await interaction.channel.send(
+                f"\n**{mode_name.upper()} VETO**\n{team_name}, please **BAN** a map:",
+                view=view
+            )
+        elif action_type == "PICK_MAP":
+            view = MapVetoView(self.session, mode_state)
+            await interaction.channel.send(
+                f"\n**{mode_name.upper()} VETO**\n{team_name}, please **PICK** a map for Map {detail}:",
+                view=view
+            )
+
+    def disable_all_buttons(self):
+        for child in self.children:
+            child.disabled = True
 
 class SideSelectionView(View):
     def __init__(self, session: MatchVetoSession):
@@ -922,11 +1133,31 @@ async def start_match(interaction: discord.Interaction):
     
     team_b = parts[1].strip()
 
+    guild_id = interaction.guild_id
+    
+    # Determine higher seed
+    seed_method, higher_seed_team = determine_higher_seed(guild_id, team_a, team_b)
+    
+    # Create session with original team names
     session = MatchVetoSession(thread, team_a, team_b)
-
-    # Side selection - veto will start AFTER side is picked
-    side_view = SideSelectionView(session)
-    await interaction.response.send_message(f"{team_a}, pick your side:", view=side_view)
+    
+    # Show seeding message
+    if seed_method == 'COIN':
+        seed_msg = f"🎲 **Coin flip!** {higher_seed_team} won the coin flip."
+    else:
+        seed_msg = f"📊 **Higher seed:** {higher_seed_team}"
+    
+    await interaction.response.send_message(
+        f"{seed_msg}\n{higher_seed_team}, choose which team you want to be:",
+        ephemeral=False
+    )
+    
+    # Team selection - higher seed picks Team A or Team B
+    team_select_view = TeamSelectionView(session, seed_method)
+    await interaction.channel.send(
+        f"{higher_seed_team}, do you want to be **Team A** or **Team B**?",
+        view=team_select_view
+    )
 
 @tree.command(name="show_match", description="Show the complete mapset for this match")
 async def show_match(interaction: discord.Interaction):
@@ -1043,6 +1274,9 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
     cur.close()
     conn.close()
     
+    # Update standings after recording result
+    update_standings(guild_id)
+    
     await interaction.response.send_message(f"Result recorded: {team_a} {map_wins_a} - {map_wins_b} {team_b}", ephemeral=False)
 
 @tree.command(name="show_results", description="Show all match results")
@@ -1067,46 +1301,55 @@ async def show_results(interaction: discord.Interaction):
 @tree.command(name="standings", description="Show league standings")
 async def standings(interaction: discord.Interaction):
     guild_id = interaction.guild_id
+    
+    # Update standings first
+    update_standings(guild_id)
+    
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT team_a, team_b, map_wins_a, map_wins_b FROM match_results WHERE guild_id=%s", (guild_id,))
+    cur.execute("""
+        SELECT team_name, match_wins, match_losses, match_ties, map_wins, map_losses,
+               match_win_percentage, map_win_percentage
+        FROM standings
+        WHERE guild_id=%s
+        ORDER BY match_win_percentage DESC, map_win_percentage DESC, match_wins DESC
+    """, (guild_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
     
     if not rows:
-        return await interaction.response.send_message("No match results recorded yet.", ephemeral=True)
+        return await interaction.response.send_message("No standings data available yet.", ephemeral=True)
 
-    stats = {}
-    for team_a, team_b, wins_a, wins_b in rows:
-        for team in [team_a, team_b]:
-            if team not in stats:
-                stats[team] = {"match_wins":0, "match_losses":0, "maps_won":0, "maps_lost":0}
-        stats[team_a]["maps_won"] += wins_a
-        stats[team_a]["maps_lost"] += wins_b
-        stats[team_b]["maps_won"] += wins_b
-        stats[team_b]["maps_lost"] += wins_a
-        if wins_a > wins_b:
-            stats[team_a]["match_wins"] += 1
-            stats[team_b]["match_losses"] += 1
-        elif wins_b > wins_a:
-            stats[team_b]["match_wins"] += 1
-            stats[team_a]["match_losses"] += 1
-
-    def sort_key(item):
-        team, s = item
-        return (s["match_wins"], s["maps_won"]-s["maps_lost"], s["maps_won"])
-    sorted_stats = sorted(stats.items(), key=sort_key, reverse=True)
-
-    embed = discord.Embed(title="League Standings")
-    for rank, (team, s) in enumerate(sorted_stats, start=1):
+    embed = discord.Embed(title="League Standings", color=discord.Color.gold())
+    
+    for rank, (team_name, match_wins, match_losses, match_ties, map_wins, map_losses, match_pct, map_pct) in enumerate(rows, start=1):
+        total_matches = match_wins + match_losses + match_ties
+        record = f"{match_wins}-{match_losses}"
+        if match_ties > 0:
+            record += f"-{match_ties}"
+        
         embed.add_field(
-            name=f"{rank}. {team}",
-            value=f"Match W-L: {s['match_wins']}-{s['match_losses']}\nMaps W-L: {s['maps_won']}-{s['maps_lost']}",
+            name=f"{rank}. {team_name}",
+            value=(
+                f"**Record:** {record} ({match_pct:.1f}%)\n"
+                f"**Maps:** {map_wins}-{map_losses} ({map_pct:.1f}%)"
+            ),
             inline=False
         )
+    
     await interaction.response.send_message(embed=embed)
+
+@tree.command(name="recalculate_standings", description="Manually recalculate standings from match results (Admin only)")
+async def recalculate_standings(interaction: discord.Interaction):
+    if not is_guild_admin(interaction):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+    
+    guild_id = interaction.guild_id
+    update_standings(guild_id)
+    
+    await interaction.response.send_message("✓ Standings recalculated successfully!", ephemeral=False)
 
 # -----------------------------
 # Help Command
@@ -1154,7 +1397,8 @@ async def help_command(interaction: discord.Interaction):
             "`/show_match` - Show complete mapset for this match\n"
             "`/set_result <map_wins_a> <map_wins_b> [playoff]` - Record match result\n"
             "`/show_results` - View all match results\n"
-            "`/standings` - View league standings"
+            "`/standings` - View league standings\n"
+            "`/recalculate_standings` - Recalculate standings (Admin)"
         ),
         inline=False
     )
