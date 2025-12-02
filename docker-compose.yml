@@ -11,16 +11,25 @@ services:
     ports:
       - "5432:5432"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   bo7bot:
     build: .
     container_name: bo7bot
     env_file: .env
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     volumes:
-      - ./data:/app/data  # optional: logs, persistent files
+      - ./data:/app/data
+      - ./migrations:/app/migrations  # Mount migrations directory
     restart: unless-stopped
+    environment:
+      - DB_HOST=db  # Override to use docker service name
 
 volumes:
   pgdata:

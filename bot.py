@@ -39,72 +39,8 @@ def get_db_connection():
         password=DB_PASSWORD
     )
 
-# Initialize database tables
-def init_database():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Teams table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS teams (
-        team_id SERIAL PRIMARY KEY,
-        guild_id BIGINT NOT NULL,
-        team_name TEXT NOT NULL,
-        UNIQUE(guild_id, team_name)
-    )
-    """)
-    
-    # Players table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS players (
-        player_id SERIAL PRIMARY KEY,
-        guild_id BIGINT NOT NULL,
-        team_id INTEGER REFERENCES teams(team_id) ON DELETE CASCADE,
-        player_name TEXT NOT NULL,
-        is_captain INTEGER DEFAULT 0
-    )
-    """)
-    
-    # Schedule table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS schedule (
-        match_id SERIAL PRIMARY KEY,
-        guild_id BIGINT NOT NULL,
-        week INTEGER NOT NULL,
-        team_a TEXT NOT NULL,
-        team_b TEXT NOT NULL
-    )
-    """)
-    
-    # League settings table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS league_settings (
-        guild_id BIGINT NOT NULL,
-        key TEXT NOT NULL,
-        value TEXT,
-        PRIMARY KEY(guild_id, key)
-    )
-    """)
-    
-    # Match results table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS match_results (
-        thread_id BIGINT PRIMARY KEY,
-        guild_id BIGINT NOT NULL,
-        team_a TEXT NOT NULL,
-        team_b TEXT NOT NULL,
-        map_wins_a INTEGER NOT NULL,
-        map_wins_b INTEGER NOT NULL,
-        is_playoff INTEGER DEFAULT 0
-    )
-    """)
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# Initialize database on startup
-init_database()
+# Note: Database initialization is now handled by migrations
+# Run: python migrate.py up
 
 # -----------------------------
 # Bot setup
@@ -639,15 +575,17 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
     cur.execute("DELETE FROM schedule WHERE guild_id=%s", (guild_id,))
 
     matchups = []
+    match_number = 1
     for week in range(1, weeks + 1):
         shuffled = teams[:]
         random.shuffle(shuffled)
         for i in range(0, len(shuffled) - 1, 2):
             team_a = shuffled[i]
             team_b = shuffled[i + 1]
-            matchups.append((guild_id, week, team_a, team_b))
+            matchups.append((guild_id, match_number, week, team_a, team_b))
+            match_number += 1
 
-    cur.executemany("INSERT INTO schedule (guild_id, week, team_a, team_b) VALUES (%s, %s, %s, %s)", matchups)
+    cur.executemany("INSERT INTO schedule (guild_id, match_number, week, team_a, team_b) VALUES (%s, %s, %s, %s, %s)", matchups)
     conn.commit()
     cur.close()
     conn.close()
@@ -655,9 +593,8 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
     await interaction.response.send_message(f"Generated schedule for {weeks} weeks with {len(matchups)} matches.", ephemeral=False)
 
 
-@tree.command(name="lock_schedule", description="Lock schedule and create match threads")
-@app_commands.describe(channel="Channel to create match threads")
-async def lock_schedule(interaction: discord.Interaction, channel: discord.TextChannel):
+@tree.command(name="lock_schedule", description="Lock schedule to prevent changes (Admin only)")
+async def lock_schedule(interaction: discord.Interaction):
     if not is_guild_admin(interaction):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
@@ -666,26 +603,82 @@ async def lock_schedule(interaction: discord.Interaction, channel: discord.TextC
     if is_schedule_locked(guild_id):
         return await interaction.response.send_message("Schedule is already locked.", ephemeral=True)
 
-    await interaction.response.defer(ephemeral=True)
-
     conn = get_db_connection()
     cur = conn.cursor()
     
     cur.execute("INSERT INTO league_settings (guild_id, key, value) VALUES (%s, 'locked', 'True') ON CONFLICT (guild_id, key) DO UPDATE SET value='True'", (guild_id,))
     conn.commit()
+    cur.close()
+    conn.close()
 
-    cur.execute("SELECT team_a, team_b, week FROM schedule WHERE guild_id=%s ORDER BY week", (guild_id,))
+    await interaction.response.send_message("Schedule has been locked and cannot be changed.", ephemeral=False)
+
+@tree.command(name="unlock_schedule", description="Unlock schedule to allow changes (Admin only)")
+async def unlock_schedule(interaction: discord.Interaction):
+    if not is_guild_admin(interaction):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    guild_id = interaction.guild_id
+
+    if not is_schedule_locked(guild_id):
+        return await interaction.response.send_message("Schedule is not locked.", ephemeral=True)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("INSERT INTO league_settings (guild_id, key, value) VALUES (%s, 'locked', 'False') ON CONFLICT (guild_id, key) DO UPDATE SET value='False'", (guild_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    await interaction.response.send_message("Schedule has been unlocked and can now be modified.", ephemeral=False)
+
+@tree.command(name="create_match_threads", description="Create match threads for a specific week (Admin only)")
+@app_commands.describe(channel="Channel to create match threads in", week="Week number to create threads for")
+async def create_match_threads(interaction: discord.Interaction, channel: discord.TextChannel, week: int):
+    if not is_guild_admin(interaction):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    guild_id = interaction.guild_id
+    
+    await interaction.response.defer(ephemeral=True)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT match_number, team_a, team_b FROM schedule WHERE guild_id=%s AND week=%s ORDER BY match_number", (guild_id, week))
     matches = cur.fetchall()
     cur.close()
     conn.close()
     
+    if not matches:
+        return await interaction.followup.send(f"No matches found for week {week}.", ephemeral=True)
+    
     created_threads = []
-    for team_a, team_b, week in matches:
-        thread_name = f"Week {week}: {team_a} vs {team_b}"
-        thread = await channel.create_thread(name=thread_name, type=discord.ChannelType.public_thread, auto_archive_duration=1440)
-        created_threads.append(thread.mention)
+    for match_number, team_a, team_b in matches:
+        thread_name = f"Match {match_number} - Week {week}: {team_a} vs {team_b}"
+        
+        # Check if thread already exists
+        existing_thread = None
+        for thread in channel.threads:
+            if thread.name == thread_name:
+                existing_thread = thread
+                break
+        
+        if existing_thread:
+            created_threads.append(f"{existing_thread.mention} (already exists)")
+        else:
+            thread = await channel.create_thread(
+                name=thread_name, 
+                type=discord.ChannelType.public_thread, 
+                auto_archive_duration=1440
+            )
+            created_threads.append(thread.mention)
 
-    await interaction.followup.send(f"Schedule locked and match threads created:\n" + "\n".join(created_threads))
+    await interaction.followup.send(
+        f"Match threads created for Week {week}:\n" + "\n".join(created_threads),
+        ephemeral=True
+    )
 
 @tree.command(name="delete_schedule", description="Delete schedule and match threads (Admin only)")
 @app_commands.describe(channel="Channel where match threads were created")
@@ -697,7 +690,7 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT team_a, team_b FROM schedule WHERE guild_id=%s", (guild_id,))
+    cur.execute("SELECT match_number, team_a, team_b, week FROM schedule WHERE guild_id=%s", (guild_id,))
     matches = cur.fetchall()
     
     if not matches:
@@ -708,15 +701,21 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
     await interaction.response.defer(ephemeral=True)
 
     deleted_threads = []
-    for team_a, team_b in matches:
-        thread_name = f"{team_a} vs {team_b}"
+    for match_number, team_a, team_b, week in matches:
+        # Try both old and new thread name formats
+        thread_names = [
+            f"Match {match_number} - Week {week}: {team_a} vs {team_b}",
+            f"Week {week}: {team_a} vs {team_b}",
+            f"{team_a} vs {team_b}"
+        ]
         for thread in channel.threads:
-            if thread.name == thread_name:
+            if thread.name in thread_names:
                 try:
                     await thread.delete()
-                    deleted_threads.append(thread_name)
+                    deleted_threads.append(thread.name)
+                    break
                 except Exception as e:
-                    print(f"Failed to delete thread {thread_name}: {e}")
+                    print(f"Failed to delete thread {thread.name}: {e}")
 
     cur.execute("DELETE FROM schedule WHERE guild_id=%s", (guild_id,))
     cur.execute("INSERT INTO league_settings (guild_id, key, value) VALUES (%s, 'locked', 'False') ON CONFLICT (guild_id, key) DO UPDATE SET value='False'", (guild_id,))
@@ -732,7 +731,7 @@ async def show_schedule(interaction: discord.Interaction):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT match_id, week, team_a, team_b FROM schedule WHERE guild_id=%s ORDER BY week, match_id", (guild_id,))
+    cur.execute("SELECT match_number, week, team_a, team_b FROM schedule WHERE guild_id=%s ORDER BY match_number", (guild_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -740,15 +739,47 @@ async def show_schedule(interaction: discord.Interaction):
     if not rows:
         return await interaction.response.send_message("No schedule found.", ephemeral=True)
     
-    embed = discord.Embed(title="League Schedule")
-    current_week = None
-    for match_id, week, team_a, team_b in rows:
-        if week != current_week:
-            embed.add_field(name=f"Week {week}", value="—", inline=False)
-            current_week = week
-        embed.add_field(name=f"Match {match_id}: {team_a} vs {team_b}", value="\u200b", inline=False)
+    # Group matches by week
+    weeks_data = {}
+    for match_number, week, team_a, team_b in rows:
+        if week not in weeks_data:
+            weeks_data[week] = []
+        weeks_data[week].append((match_number, team_a, team_b))
     
-    await interaction.response.send_message(embed=embed)
+    # Create multiple embeds if needed (25 field limit per embed)
+    embeds = []
+    current_embed = discord.Embed(title="League Schedule")
+    field_count = 0
+    
+    for week in sorted(weeks_data.keys()):
+        matches = weeks_data[week]
+        
+        # Create week header as a single field with all matches
+        matches_text = "\n".join([f"Match {num}: {ta} vs {tb}" for num, ta, tb in matches])
+        
+        # Check if adding this would exceed limit
+        if field_count >= 24:  # Leave room for one more field
+            embeds.append(current_embed)
+            current_embed = discord.Embed(title="League Schedule (continued)")
+            field_count = 0
+        
+        current_embed.add_field(
+            name=f"Week {week}",
+            value=matches_text,
+            inline=False
+        )
+        field_count += 1
+    
+    # Add the last embed
+    if field_count > 0:
+        embeds.append(current_embed)
+    
+    # Send the first embed
+    await interaction.response.send_message(embed=embeds[0])
+    
+    # Send additional embeds as follow-ups
+    for embed in embeds[1:]:
+        await interaction.followup.send(embed=embed)
 
 # -----------------------------
 # Match Commands
@@ -763,7 +794,13 @@ async def start_match(interaction: discord.Interaction):
     if len(parts) < 2:
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
 
-    team_a = parts[0].strip().split(": ")[-1]
+    # Extract team names - handle both "Match X - Week Y: Team A vs Team B" and "Week Y: Team A vs Team B"
+    team_a_part = parts[0].strip()
+    if ": " in team_a_part:
+        team_a = team_a_part.split(": ")[-1]
+    else:
+        team_a = team_a_part
+    
     team_b = parts[1].strip()
 
     session = MatchVetoSession(thread, team_a, team_b)
@@ -782,7 +819,13 @@ async def show_match(interaction: discord.Interaction):
     if len(parts) < 2:
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
 
-    team_a = parts[0].strip().split(": ")[-1]
+    # Extract team names - handle both formats
+    team_a_part = parts[0].strip()
+    if ": " in team_a_part:
+        team_a = team_a_part.split(": ")[-1]
+    else:
+        team_a = team_a_part
+    
     team_b = parts[1].strip()
     
     embed = discord.Embed(
@@ -858,8 +901,13 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
     if len(parts) < 2:
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
     
-    # Extract actual team names (remove "Week X: " prefix if present)
-    team_a = parts[0].strip().split(": ")[-1]
+    # Extract actual team names - handle both formats
+    team_a_part = parts[0].strip()
+    if ": " in team_a_part:
+        team_a = team_a_part.split(": ")[-1]
+    else:
+        team_a = team_a_part
+    
     team_b = parts[1].strip()
 
     conn = get_db_connection()
@@ -969,7 +1017,9 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/generate_schedule <weeks>` - Generate league schedule (Admin)\n"
             "`/show_schedule` - View current schedule\n"
-            "`/lock_schedule <channel>` - Lock schedule and create match threads (Admin)\n"
+            "`/lock_schedule` - Lock schedule to prevent changes (Admin)\n"
+            "`/unlock_schedule` - Unlock schedule (Admin)\n"
+            "`/create_match_threads <channel> <week>` - Create match threads for a week (Admin)\n"
             "`/delete_schedule <channel>` - Delete schedule and threads (Admin)"
         ),
         inline=False
