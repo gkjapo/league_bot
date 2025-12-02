@@ -547,6 +547,125 @@ async def add_player(interaction: discord.Interaction, team_id: int, player_name
 
     await interaction.response.send_message(f"Player '{player_name}' added to team '{row[0]}'.", ephemeral=False)
 
+@tree.command(name="remove_player", description="Remove a player from their team (Admin only)")
+@app_commands.describe(player_name="Name of the player to remove", team_id="Team ID (optional - if not specified, searches all teams)")
+async def remove_player(interaction: discord.Interaction, player_name: str, team_id: int = None):
+    if not is_guild_admin(interaction):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if team_id:
+        # Remove from specific team
+        cur.execute("SELECT team_name FROM teams WHERE guild_id=%s AND team_id=%s", (guild_id, team_id))
+        team_row = cur.fetchone()
+        if not team_row:
+            cur.close()
+            conn.close()
+            return await interaction.response.send_message(f"No team found with ID {team_id}.", ephemeral=True)
+        
+        cur.execute(
+            "DELETE FROM players WHERE guild_id=%s AND team_id=%s AND player_name=%s RETURNING player_id",
+            (guild_id, team_id, player_name)
+        )
+        deleted = cur.fetchone()
+        
+        if deleted:
+            conn.commit()
+            cur.close()
+            conn.close()
+            return await interaction.response.send_message(
+                f"Player '{player_name}' removed from team '{team_row[0]}'.", 
+                ephemeral=False
+            )
+        else:
+            cur.close()
+            conn.close()
+            return await interaction.response.send_message(
+                f"Player '{player_name}' not found on team '{team_row[0]}'.", 
+                ephemeral=True
+            )
+    else:
+        # Search all teams for this player
+        cur.execute(
+            """
+            SELECT p.player_id, p.team_id, t.team_name 
+            FROM players p
+            JOIN teams t ON p.team_id = t.team_id
+            WHERE p.guild_id=%s AND p.player_name=%s
+            """,
+            (guild_id, player_name)
+        )
+        matches = cur.fetchall()
+        
+        if not matches:
+            cur.close()
+            conn.close()
+            return await interaction.response.send_message(
+                f"Player '{player_name}' not found in any team.", 
+                ephemeral=True
+            )
+        
+        if len(matches) > 1:
+            # Multiple players with same name - require team_id
+            teams_list = ", ".join([f"{team_name} (ID {tid})" for _, tid, team_name in matches])
+            cur.close()
+            conn.close()
+            return await interaction.response.send_message(
+                f"Multiple players named '{player_name}' found in teams: {teams_list}\n"
+                f"Please specify the team_id parameter to remove the correct player.",
+                ephemeral=True
+            )
+        
+        # Only one match - remove it
+        player_id, team_id, team_name = matches[0]
+        cur.execute("DELETE FROM players WHERE player_id=%s", (player_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return await interaction.response.send_message(
+            f"Player '{player_name}' removed from team '{team_name}'.", 
+            ephemeral=False
+        )
+
+@tree.command(name="remove_team", description="Remove a team and all its players (Admin only)")
+@app_commands.describe(team_id="Team ID to remove")
+async def remove_team(interaction: discord.Interaction, team_id: int):
+    if not is_guild_admin(interaction):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    guild_id = interaction.guild_id
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Check if team exists
+    cur.execute("SELECT team_name FROM teams WHERE guild_id=%s AND team_id=%s", (guild_id, team_id))
+    team_row = cur.fetchone()
+    
+    if not team_row:
+        cur.close()
+        conn.close()
+        return await interaction.response.send_message(f"No team found with ID {team_id}.", ephemeral=True)
+    
+    team_name = team_row[0]
+    
+    # Get player count
+    cur.execute("SELECT COUNT(*) FROM players WHERE guild_id=%s AND team_id=%s", (guild_id, team_id))
+    player_count = cur.fetchone()[0]
+    
+    # Delete team (players will be deleted automatically due to CASCADE)
+    cur.execute("DELETE FROM teams WHERE team_id=%s", (team_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    await interaction.response.send_message(
+        f"Team '{team_name}' and {player_count} player(s) removed successfully.", 
+        ephemeral=False
+    )
 
 # -----------------------------
 # Schedule Commands
@@ -1006,6 +1125,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/register_team <team_name>` - Register a new team (Admin)\n"
             "`/add_player <team_id> <player_name> [is_captain]` - Add player to team (Admin)\n"
+            "`/remove_player <player_name> [team_id]` - Remove player from team (Admin)\n"
+            "`/remove_team <team_id>` - Remove team and all players (Admin)\n"
             "`/show_teams` - List all teams and their players"
         ),
         inline=False
