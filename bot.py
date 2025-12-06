@@ -87,7 +87,7 @@ def update_standings(guild_id: int):
     
     # Get all match results for this guild
     cur.execute("""
-        SELECT team_a, team_b, map_wins_a, map_wins_b 
+        SELECT home_team, away_team, home_wins, away_wins 
         FROM match_results 
         WHERE guild_id=%s AND is_playoff=0
     """, (guild_id,))
@@ -96,9 +96,9 @@ def update_standings(guild_id: int):
     # Calculate stats for each team
     team_stats = {}
     
-    for team_a, team_b, wins_a, wins_b in results:
+    for home_team, away_team, wins_home, wins_away in results:
         # Initialize teams if not exists
-        for team in [team_a, team_b]:
+        for team in [home_team, away_team]:
             if team not in team_stats:
                 team_stats[team] = {
                     'match_wins': 0,
@@ -109,21 +109,21 @@ def update_standings(guild_id: int):
                 }
         
         # Update map counts
-        team_stats[team_a]['map_wins'] += wins_a
-        team_stats[team_a]['map_losses'] += wins_b
-        team_stats[team_b]['map_wins'] += wins_b
-        team_stats[team_b]['map_losses'] += wins_a
+        team_stats[home_team]['map_wins'] += wins_home
+        team_stats[home_team]['map_losses'] += wins_away
+        team_stats[away_team]['map_wins'] += wins_away
+        team_stats[away_team]['map_losses'] += wins_home
         
         # Update match counts
-        if wins_a > wins_b:
-            team_stats[team_a]['match_wins'] += 1
-            team_stats[team_b]['match_losses'] += 1
-        elif wins_b > wins_a:
-            team_stats[team_b]['match_wins'] += 1
-            team_stats[team_a]['match_losses'] += 1
+        if wins_home > wins_away:
+            team_stats[home_team]['match_wins'] += 1
+            team_stats[away_team]['match_losses'] += 1
+        elif wins_away > wins_home:
+            team_stats[away_team]['match_wins'] += 1
+            team_stats[home_team]['match_losses'] += 1
         else:
-            team_stats[team_a]['match_ties'] += 1
-            team_stats[team_b]['match_ties'] += 1
+            team_stats[home_team]['match_ties'] += 1
+            team_stats[away_team]['match_ties'] += 1
     
     # Update standings table
     for team_name, stats in team_stats.items():
@@ -904,23 +904,76 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
 
     cur.execute("DELETE FROM schedule WHERE guild_id=%s", (guild_id,))
 
+    # Generate all unique matchups (home/away matters)
+    # Team A (home) vs Team B (away) is different from Team B (home) vs Team A (away)
+    all_unique_matchups = []
+    for i in range(len(teams)):
+        for j in range(len(teams)):
+            if i != j:  # Can't play against yourself
+                all_unique_matchups.append((teams[i], teams[j]))  # (home, away)
+    
+    # Calculate matches per week (teams / 2, rounded down)
+    matches_per_week = len(teams) // 2
+    total_matches_needed = weeks * matches_per_week
+    
+    # Build matchup pool: fill with unique matchups first, then repeat if needed
+    matchup_pool = []
+    cycles_needed = (total_matches_needed // len(all_unique_matchups)) + 1
+    
+    for cycle in range(cycles_needed):
+        shuffled_unique = all_unique_matchups[:]
+        random.shuffle(shuffled_unique)
+        matchup_pool.extend(shuffled_unique)
+    
+    # Now assign matchups to weeks ensuring no team plays twice in same week
     matchups = []
     match_number = 1
+    pool_index = 0
+    
     for week in range(1, weeks + 1):
-        shuffled = teams[:]
-        random.shuffle(shuffled)
-        for i in range(0, len(shuffled) - 1, 2):
-            team_a = shuffled[i]
-            team_b = shuffled[i + 1]
-            matchups.append((guild_id, match_number, week, team_a, team_b))
-            match_number += 1
+        week_matchups = []
+        teams_used_this_week = set()
+        
+        # Try to fill this week with matches
+        attempts = 0
+        max_attempts = len(matchup_pool)
+        
+        while len(week_matchups) < matches_per_week and attempts < max_attempts:
+            if pool_index >= len(matchup_pool):
+                break
+                
+            home_team, away_team = matchup_pool[pool_index]
+            
+            # Check if either team is already playing this week
+            if home_team not in teams_used_this_week and away_team not in teams_used_this_week:
+                week_matchups.append((guild_id, match_number, week, home_team, away_team))
+                teams_used_this_week.add(home_team)
+                teams_used_this_week.add(away_team)
+                match_number += 1
+                pool_index += 1
+            else:
+                # Skip this matchup for now, try next one
+                pool_index += 1
+            
+            attempts += 1
+        
+        matchups.extend(week_matchups)
+        
+        # If we couldn't fill the week, break early
+        if len(week_matchups) == 0:
+            break
 
-    cur.executemany("INSERT INTO schedule (guild_id, match_number, week, team_a, team_b) VALUES (%s, %s, %s, %s, %s)", matchups)
+    cur.executemany("INSERT INTO schedule (guild_id, match_number, week, home_team, away_team) VALUES (%s, %s, %s, %s, %s)", matchups)
     conn.commit()
     cur.close()
     conn.close()
 
-    await interaction.response.send_message(f"Generated schedule for {weeks} weeks with {len(matchups)} matches.", ephemeral=False)
+    unique_count = len(all_unique_matchups)
+    await interaction.response.send_message(
+        f"Generated schedule for {weeks} weeks with {len(matchups)} matches.\n"
+        f"Total unique matchups possible: {unique_count} (home/away considered)",
+        ephemeral=False
+    )
 
 
 @tree.command(name="lock_schedule", description="Lock schedule to prevent changes (Admin only)")
@@ -976,7 +1029,7 @@ async def create_match_threads(interaction: discord.Interaction, channel: discor
     conn = get_db_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT match_number, team_a, team_b FROM schedule WHERE guild_id=%s AND week=%s ORDER BY match_number", (guild_id, week))
+    cur.execute("SELECT match_number, home_team, away_team FROM schedule WHERE guild_id=%s AND week=%s ORDER BY match_number", (guild_id, week))
     matches = cur.fetchall()
     cur.close()
     conn.close()
@@ -985,8 +1038,8 @@ async def create_match_threads(interaction: discord.Interaction, channel: discor
         return await interaction.followup.send(f"No matches found for week {week}.", ephemeral=True)
     
     created_threads = []
-    for match_number, team_a, team_b in matches:
-        thread_name = f"Match {match_number} - Week {week}: {team_a} vs {team_b}"
+    for match_number, home_team, away_team in matches:
+        thread_name = f"Match {match_number} - Week {week}: {home_team} vs {away_team}"
         
         # Check if thread already exists
         existing_thread = None
@@ -1020,7 +1073,7 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT match_number, team_a, team_b, week FROM schedule WHERE guild_id=%s", (guild_id,))
+    cur.execute("SELECT match_number, home_team, away_team, week FROM schedule WHERE guild_id=%s", (guild_id,))
     matches = cur.fetchall()
     
     if not matches:
@@ -1031,12 +1084,12 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
     await interaction.response.defer(ephemeral=True)
 
     deleted_threads = []
-    for match_number, team_a, team_b, week in matches:
+    for match_number, home_team, away_team, week in matches:
         # Try both old and new thread name formats
         thread_names = [
-            f"Match {match_number} - Week {week}: {team_a} vs {team_b}",
-            f"Week {week}: {team_a} vs {team_b}",
-            f"{team_a} vs {team_b}"
+            f"Match {match_number} - Week {week}: {home_team} vs {away_team}",
+            f"Week {week}: {home_team} vs {away_team}",
+            f"{home_team} vs {away_team}"
         ]
         for thread in channel.threads:
             if thread.name in thread_names:
@@ -1240,8 +1293,8 @@ async def show_match(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="set_result", description="Set match result")
-@app_commands.describe(map_wins_a="Maps won by Team A", map_wins_b="Maps won by Team B", playoff="Is playoff match?")
-async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins_b: int, playoff: bool=False):
+@app_commands.describe(home_wins="Maps won by home team", away_wins="Maps won by away team", playoff="Is playoff match?")
+async def set_result(interaction: discord.Interaction, home_wins: int, away_wins: int, playoff: bool=False):
     if not isinstance(interaction.channel, discord.Thread):
         return await interaction.response.send_message("Use this command inside a match thread.", ephemeral=True)
 
@@ -1252,24 +1305,24 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
     
     # Extract actual team names - handle both formats
-    team_a_part = parts[0].strip()
-    if ": " in team_a_part:
-        team_a = team_a_part.split(": ")[-1]
+    home_team_part = parts[0].strip()
+    if ": " in home_team_part:
+        home_team = home_team_part.split(": ")[-1]
     else:
-        team_a = team_a_part
+        home_team = home_team_part
     
-    team_b = parts[1].strip()
+    away_team = parts[1].strip()
 
     conn = get_db_connection()
     cur = conn.cursor()
     
     cur.execute("""
-        INSERT INTO match_results (thread_id, guild_id, team_a, team_b, map_wins_a, map_wins_b, is_playoff)
+        INSERT INTO match_results (thread_id, guild_id, home_team, away_team, home_wins, away_wins, is_playoff)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (thread_id) DO UPDATE SET
-        guild_id=%s, team_a=%s, team_b=%s, map_wins_a=%s, map_wins_b=%s, is_playoff=%s
-    """, (thread.id, guild_id, team_a, team_b, map_wins_a, map_wins_b, int(playoff),
-          guild_id, team_a, team_b, map_wins_a, map_wins_b, int(playoff)))
+        guild_id=%s, home_team=%s, away_team=%s, home_wins=%s, away_wins=%s, is_playoff=%s
+    """, (thread.id, guild_id, home_team, away_team, home_wins, away_wins, int(playoff),
+          guild_id, home_team, away_team, home_wins, away_wins, int(playoff)))
     conn.commit()
     cur.close()
     conn.close()
@@ -1277,7 +1330,7 @@ async def set_result(interaction: discord.Interaction, map_wins_a: int, map_wins
     # Update standings after recording result
     update_standings(guild_id)
     
-    await interaction.response.send_message(f"Result recorded: {team_a} {map_wins_a} - {map_wins_b} {team_b}", ephemeral=False)
+    await interaction.response.send_message(f"Result recorded: {home_team} (H) {home_wins} - {away_wins} {away_team} (A)", ephemeral=False)
 
 @tree.command(name="show_results", description="Show all match results")
 async def show_results(interaction: discord.Interaction):
@@ -1285,7 +1338,7 @@ async def show_results(interaction: discord.Interaction):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT team_a, team_b, map_wins_a, map_wins_b FROM match_results WHERE guild_id=%s ORDER BY thread_id", (guild_id,))
+    cur.execute("SELECT home_team, away_team, home_wins, away_wins FROM match_results WHERE guild_id=%s ORDER BY thread_id", (guild_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -1294,8 +1347,8 @@ async def show_results(interaction: discord.Interaction):
         return await interaction.response.send_message("No match results recorded yet.", ephemeral=True)
     
     embed = discord.Embed(title="League Match Results")
-    for team_a, team_b, wins_a, wins_b in rows:
-        embed.add_field(name=f"{team_a} vs {team_b}", value=f"{wins_a} - {wins_b}", inline=False)
+    for home_team, away_team, wins_home, wins_away in rows:
+        embed.add_field(name=f"{home_team} (H) vs {away_team} (A)", value=f"{wins_home} - {wins_away}", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="standings", description="Show league standings")
