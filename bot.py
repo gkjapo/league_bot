@@ -905,7 +905,6 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
     cur.execute("DELETE FROM schedule WHERE guild_id=%s", (guild_id,))
 
     # Generate all unique matchups (home/away matters)
-    # Team A (home) vs Team B (away) is different from Team B (home) vs Team A (away)
     all_unique_matchups = []
     for i in range(len(teams)):
         for j in range(len(teams)):
@@ -928,38 +927,35 @@ async def generate_schedule(interaction: discord.Interaction, weeks: int):
     # Now assign matchups to weeks ensuring no team plays twice in same week
     matchups = []
     match_number = 1
-    pool_index = 0
+    used_matchups_indices = set()
     
     for week in range(1, weeks + 1):
         week_matchups = []
         teams_used_this_week = set()
         
-        # Try to fill this week with matches
-        attempts = 0
-        max_attempts = len(matchup_pool)
-        
-        while len(week_matchups) < matches_per_week and attempts < max_attempts:
-            if pool_index >= len(matchup_pool):
+        # Try to find valid matchups from the pool
+        for pool_idx in range(len(matchup_pool)):
+            # Skip already used matchups
+            if pool_idx in used_matchups_indices:
+                continue
+            
+            # Check if we've filled this week
+            if len(week_matchups) >= matches_per_week:
                 break
                 
-            home_team, away_team = matchup_pool[pool_index]
+            home_team, away_team = matchup_pool[pool_idx]
             
             # Check if either team is already playing this week
             if home_team not in teams_used_this_week and away_team not in teams_used_this_week:
                 week_matchups.append((guild_id, match_number, week, home_team, away_team))
                 teams_used_this_week.add(home_team)
                 teams_used_this_week.add(away_team)
+                used_matchups_indices.add(pool_idx)
                 match_number += 1
-                pool_index += 1
-            else:
-                # Skip this matchup for now, try next one
-                pool_index += 1
-            
-            attempts += 1
         
         matchups.extend(week_matchups)
         
-        # If we couldn't fill the week, break early
+        # If we couldn't fill the week, we've run out of valid matchups
         if len(week_matchups) == 0:
             break
 
@@ -1039,7 +1035,7 @@ async def create_match_threads(interaction: discord.Interaction, channel: discor
     
     created_threads = []
     for match_number, home_team, away_team in matches:
-        thread_name = f"Match {match_number} - Week {week}: {home_team} vs {away_team}"
+        thread_name = f"Match {match_number} - Week {week}: {away_team} vs {home_team}"
         
         # Check if thread already exists
         existing_thread = None
@@ -1087,9 +1083,9 @@ async def delete_schedule(interaction: discord.Interaction, channel: discord.Tex
     for match_number, home_team, away_team, week in matches:
         # Try both old and new thread name formats
         thread_names = [
-            f"Match {match_number} - Week {week}: {home_team} vs {away_team}",
-            f"Week {week}: {home_team} vs {away_team}",
-            f"{home_team} vs {away_team}"
+            f"Match {match_number} - Week {week}: {away_team} vs {home_team}",
+            f"Week {week}: {away_team} vs {home_team}",
+            f"{away_team} vs {home_team}"
         ]
         for thread in channel.threads:
             if thread.name in thread_names:
@@ -1138,7 +1134,7 @@ async def show_schedule(interaction: discord.Interaction):
         matches = weeks_data[week]
         
         # Create week header as a single field with all matches
-        matches_text = "\n".join([f"Match {num}: {home} vs {away}" for num, home, away in matches])
+        matches_text = "\n".join([f"Match {num}: {away} vs {home}" for num, home, away in matches])
         
         # Check if adding this would exceed limit
         if field_count >= 24:  # Leave room for one more field
@@ -1177,38 +1173,27 @@ async def start_match(interaction: discord.Interaction):
     if len(parts) < 2:
         return await interaction.response.send_message("Cannot determine teams from thread name.", ephemeral=True)
 
-    # Extract team names - handle both "Match X - Week Y: Team A vs Team B" and "Week Y: Team A vs Team B"
-    team_a_part = parts[0].strip()
-    if ": " in team_a_part:
-        team_a = team_a_part.split(": ")[-1]
+    # Extract team names - thread format is now "Away vs Home"
+    away_team_part = parts[0].strip()
+    if ": " in away_team_part:
+        away_team = away_team_part.split(": ")[-1]
     else:
-        team_a = team_a_part
+        away_team = away_team_part
     
-    team_b = parts[1].strip()
+    home_team = parts[1].strip()
 
-    guild_id = interaction.guild_id
-    
-    # Determine higher seed
-    seed_method, higher_seed_team = determine_higher_seed(guild_id, team_a, team_b)
-    
-    # Create session with original team names
-    session = MatchVetoSession(thread, team_a, team_b)
-    
-    # Show seeding message
-    if seed_method == 'COIN':
-        seed_msg = f"🎲 **Coin flip!** {higher_seed_team} won the coin flip."
-    else:
-        seed_msg = f"📊 **Higher seed:** {higher_seed_team}"
+    # Create session with home team first (they get to pick Team A or B)
+    session = MatchVetoSession(thread, home_team, away_team)
     
     await interaction.response.send_message(
-        f"{seed_msg}\n{higher_seed_team}, choose which team you want to be:",
+        f"🏠 **{home_team}** (Home Team), choose which team you want to be:",
         ephemeral=False
     )
     
-    # Team selection - higher seed picks Team A or Team B
-    team_select_view = TeamSelectionView(session, seed_method)
+    # Team selection - home team picks Team A or Team B
+    team_select_view = TeamSelectionView(session, "HOME")
     await interaction.channel.send(
-        f"{higher_seed_team}, do you want to be **Team A** or **Team B**?",
+        f"{home_team}, do you want to be **Team A** or **Team B**?",
         view=team_select_view
     )
 
@@ -1330,7 +1315,7 @@ async def set_result(interaction: discord.Interaction, home_wins: int, away_wins
     # Update standings after recording result
     update_standings(guild_id)
     
-    await interaction.response.send_message(f"Result recorded: {home_team} (H) {home_wins} - {away_wins} {away_team} (A)", ephemeral=False)
+    await interaction.response.send_message(f"Result recorded: {away_team} (A) {away_wins} - {home_wins} {home_team} (H)", ephemeral=False)
 
 @tree.command(name="show_results", description="Show all match results")
 async def show_results(interaction: discord.Interaction):
@@ -1348,7 +1333,7 @@ async def show_results(interaction: discord.Interaction):
     
     embed = discord.Embed(title="League Match Results")
     for home_team, away_team, wins_home, wins_away in rows:
-        embed.add_field(name=f"{home_team} (H) vs {away_team} (A)", value=f"{wins_home} - {wins_away}", inline=False)
+        embed.add_field(name=f"{away_team} (A) vs {home_team} (H)", value=f"{wins_away} - {wins_home}", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="standings", description="Show league standings")
