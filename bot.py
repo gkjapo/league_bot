@@ -66,7 +66,7 @@ def is_schedule_locked(guild_id: int) -> bool:
     row = cur.fetchone()
     cur.close()
     conn.close()
-    return row and row[0] == "True"
+    return bool(row and row[0] == "True")
 
 def get_team_captains(guild_id: int, team_name: str):
     conn = get_db_connection()
@@ -1481,4 +1481,5 @@ async def on_ready():
 # -----------------------------
 # Run Bot
 # -----------------------------
-bot.run(BOT_TOKEN)
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)

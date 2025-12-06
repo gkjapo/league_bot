@@ -1,5 +1,8 @@
 .env
+.env.*
 .venv
 *.db
 league.db
 __pycache__/
+requirements-dev.txt
+.coverage
