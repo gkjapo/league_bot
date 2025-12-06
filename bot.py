@@ -1114,7 +1114,7 @@ async def show_schedule(interaction: discord.Interaction):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT match_number, week, team_a, team_b FROM schedule WHERE guild_id=%s ORDER BY match_number", (guild_id,))
+    cur.execute("SELECT match_number, week, home_team, away_team FROM schedule WHERE guild_id=%s ORDER BY match_number", (guild_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -1124,10 +1124,10 @@ async def show_schedule(interaction: discord.Interaction):
     
     # Group matches by week
     weeks_data = {}
-    for match_number, week, team_a, team_b in rows:
+    for match_number, week, home_team, away_team in rows:
         if week not in weeks_data:
             weeks_data[week] = []
-        weeks_data[week].append((match_number, team_a, team_b))
+        weeks_data[week].append((match_number, home_team, away_team))
     
     # Create multiple embeds if needed (25 field limit per embed)
     embeds = []
@@ -1138,7 +1138,7 @@ async def show_schedule(interaction: discord.Interaction):
         matches = weeks_data[week]
         
         # Create week header as a single field with all matches
-        matches_text = "\n".join([f"Match {num}: {ta} vs {tb}" for num, ta, tb in matches])
+        matches_text = "\n".join([f"Match {num}: {home} vs {away}" for num, home, away in matches])
         
         # Check if adding this would exceed limit
         if field_count >= 24:  # Leave room for one more field
@@ -1448,7 +1448,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/start_match` - Start veto process in match thread\n"
             "`/show_match` - Show complete mapset for this match\n"
-            "`/set_result <map_wins_a> <map_wins_b> [playoff]` - Record match result\n"
+            "`/set_result <home_wins> <away_wins> [playoff]` - Record match result\n"
             "`/show_results` - View all match results\n"
             "`/standings` - View league standings\n"
             "`/recalculate_standings` - Recalculate standings (Admin)"
